@@ -12,10 +12,6 @@ import time
 
 app = Flask(__name__)
 
-@app.route('/')
-def index():
-    return render_template_string(FORM_HTML)
-
 # === CONFIGURATION ===
 ALERTS_FILE = "alerts.json"
 if not os.path.exists(ALERTS_FILE):
