@@ -1,3 +1,4 @@
+import os
 from flask import Flask, render_template_string, request, redirect
 import requests
 from bs4 import BeautifulSoup
@@ -10,6 +11,13 @@ from threading import Thread
 import time
 
 app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return 'Hello from Render!'
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
 # === CONFIGURATION ===
 ALERTS_FILE = "alerts.json"
