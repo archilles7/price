@@ -13,11 +13,8 @@ import time
 app = Flask(__name__)
 
 @app.route('/')
-def home():
-    return 'Hello from Render!'
-
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+def index():
+    return render_template_string(FORM_HTML)
 
 # === CONFIGURATION ===
 ALERTS_FILE = "alerts.json"
@@ -323,4 +320,4 @@ def confirm():
     return "<h1>✅ Success!</h1><p>We’ll monitor this product across selected stores and email you when the price drops.</p>"
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
