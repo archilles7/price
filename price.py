@@ -79,10 +79,13 @@ STORES = {
             ".product-tile__title"
         ],
         "image_selectors": [
-            ".product-tile__image img",
-            ".product-image img",
-            "img[data-testid='product-image']",
-            ".tile-image img"
+          "img[class*='ProductGallery_image']",
+          "img[class*='product-images__image']",
+          "div[data-testid='product-image-container'] img",
+          "img[data-testid='product-image']",
+          "img[class*='ProductPage']",
+          ".product-image-gallery img",
+          ".carousel img"
         ]
     },
     "amazon": {
@@ -127,7 +130,7 @@ STORES = {
     },
     "jbhifi": {
         "base": "https://www.jbhifi.com.au",
-        "search": "/search?q={sku}",
+        "search": "/search?q={window.Product.sku}",
         "price_selectors": [
             "span[class*='PriceTag_actual']",
             "span.price",
@@ -142,10 +145,14 @@ STORES = {
             ".product-title a"
         ],
         "image_selectors": [
+            "img[class*='ProductPage__image']",
+            ".product-image-carousel img",
+            ".product-page__image img",
             ".product-tile__image img",
             ".product-image img",
-            "img.product-img"
-        ]
+            "img[data-testid='product-image']",
+            ".tile-image img"
+            ]
     },
     "officeworks": {
         "base": "https://www.officeworks.com.au",
