@@ -1,5 +1,3 @@
 flask
 requests
 beautifulsoup4
-lxml
-resend  # optional – remove if using Gmail
