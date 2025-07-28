@@ -744,7 +744,203 @@ RESULTS_HTML = '''
     <h2 class="mb-3">✅ Price Alert Set Successfully!</h2>
     <div class="row">
       <div class="col-md-6">
-        <p><strong>Product:</strong> {{original_product.name}}</p>
+        <p><strong>Target Price:</strong> ${{target_price}}</p>
+        <p><strong>Monitoring:</strong> {{stores|length}} stores</p>
+        <p><strong>Discord Notifications:</strong> Enabled ✅</p>
+      </div>
+    </div>
+  </div>
+
+  <h3 class="mb-4">📊 Current Price Comparison</h3>
+  
+  <div class="row">
+    {% for result in results %}
+    <div class="col-md-6 col-lg-4 mb-4">
+      <div class="card price-card h-100 {% if result.available and result.price <= target_price %}best-deal{% endif %} {% if not result.available %}not-available{% endif %}">
+        <div class="card-body text-center">
+          <h5 class="card-title">{{result.store}}</h5>
+          
+          {% if result.available %}
+            {% if result.image %}
+              <img src="{{result.image}}" alt="{{result.name}}" class="product-image mb-3">
+            {% else %}
+              <div class="not-available-img mb-3">
+                <span class="text-muted">📷 No Image</span>
+              </div>
+            {% endif %}
+            
+            <h6 class="text-truncate">{{result.name}}</h6>
+            <p class="h4 text-success">${{result.price}}</p>
+            
+            {% if result.price <= target_price %}
+              <div class="alert alert-success">
+                <strong>🎉 DEAL FOUND!</strong><br>
+                Save ${{retail_price - result.price}} ({{((retail_price - result.price) / retail_price * 100)|round|int}}% off)
+              </div>
+            {% else %}
+              <p class="text-muted">
+                ${{result.price - target_price}} above target
+              </p>
+            {% endif %}
+            
+            <a href="{{result.url}}" target="_blank" class="btn btn-primary btn-sm">View Product</a>
+          {% else %}
+            <div class="not-available-img mb-3">
+              <div class="text-center">
+                <h1 style="font-size: 4rem; color: #dc3545;">❌</h1>
+                <h5 class="text-danger">NOT AVAILABLE</h5>
+              </div>
+            </div>
+            <p class="text-muted">Product not found at this store</p>
+            {% if result.error %}
+              <small class="text-muted">{{result.error}}</small>
+            {% endif %}
+          {% endif %}
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="text-center mt-4">
+    <a href="/" class="btn btn-secondary">Set Another Alert</a>
+    <a href="/status" class="btn btn-info">View All Alerts</a>
+  </div>
+</div>
+</body>
+</html>
+'''
+
+@app.route('/')
+def index():
+    return render_template_string(FORM_HTML)
+
+@app.route('/preview', methods=['POST'])
+def preview():
+    """API endpoint for product preview"""
+    url = request.form.get('url', '').strip()
+    
+    if not url:
+        return jsonify({"success": False, "error": "No URL provided"})
+    
+    try:
+        product_info = get_product_info(url)
+        if product_info:
+            return jsonify({
+                "success": True,
+                "name": product_info.get("name"),
+                "image": product_info.get("image"),
+                "price": product_info.get("price")
+            })
+        else:
+            return jsonify({"success": False, "error": "Could not fetch product info"})
+    except Exception as e:
+        logging.error(f"Preview error: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route('/submit', methods=['POST'])
+def submit():
+    try:
+        url = request.form.get('url', '').strip()
+        retail_price = float(request.form.get('retail_price', 0))
+        target_price = request.form.get('target_price', '')
+        discount_rate = request.form.get('discount_rate', '')
+        discord_user = request.form.get('discord_user', '').strip()
+
+        # Validate inputs
+        if not url or retail_price <= 0:
+            return "<h1>❌ Missing required fields</h1>", 400
+        
+        # Calculate target price
+        if target_price:
+            target_price = float(target_price)
+        elif discount_rate:
+            discount_rate = float(discount_rate)
+            target_price = retail_price * (1 - discount_rate/100)
+        else:
+            return "<h1>❌ Please specify either target price or discount rate</h1>", 400
+
+        sku = extract_sku(url)
+        if not sku:
+            return """
+            <div class="container mt-5">
+                <div class="alert alert-danger">
+                    <h4>❌ Could not extract product ID</h4>
+                    <p>Make sure your URL contains a valid product identifier.</p>
+                    <a href="/" class="btn btn-primary">Try Again</a>
+                </div>
+            </div>
+            """, 400
+
+        # Get original product info
+        original_product = get_product_info(url) or {"name": "Product", "image": None}
+        
+        # Get current prices from all stores
+        results = []
+        for store_key in STORES.keys():
+            result, error = get_store_price(store_key, sku)
+            if result:
+                results.append(result)
+            else:
+                results.append({
+                    "store": store_key.capitalize(),
+                    "available": False,
+                    "error": error or "Not found"
+                })
+        
+        # Create alert
+        alert = {
+            "id": f"{int(time.time())}_{sku}",
+            "url": url,
+            "sku": sku,
+            "retail_price": retail_price,
+            "target_price": target_price,
+            "discord_user": discord_user,
+            "stores": list(STORES.keys()),
+            "notified": False,
+            "created_at": datetime.now().isoformat()
+        }
+
+        alerts = load_alerts()
+        alerts.append(alert)
+        save_alerts(alerts)
+
+        logging.info(f"New alert created: {alert['id']}")
+
+        return render_template_string(
+            RESULTS_HTML,
+            sku=sku,
+            retail_price=retail_price,
+            target_price=target_price,
+            results=results,
+            original_product=original_product,
+            stores=STORES.keys()
+        )
+        
+    except Exception as e:
+        logging.error(f"Error in submit: {e}")
+        return f"<h1>❌ Error: {str(e)}</h1>", 500
+
+@app.route('/status')
+def status():
+    """Status page showing all alerts"""
+    alerts = load_alerts()
+    active_alerts = [a for a in alerts if not a.get('notified')]
+    
+    return jsonify({
+        "status": "running",
+        "total_alerts": len(alerts),
+        "active_alerts": len(active_alerts),
+        "supported_stores": list(STORES.keys()),
+        "discord_webhook": "configured" if DISCORD_WEBHOOK_URL else "not configured"
+    })
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("DEBUG", "False").lower() == "true"
+    
+    logging.info(f"Starting Flask app on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=debug)Product:</strong> {{original_product.name}}</p>
         <p><strong>SKU/ID:</strong> {{sku}}</p>
         <p><strong>Current Retail Price:</strong> ${{retail_price}}</p>
       </div>
