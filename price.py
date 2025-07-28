@@ -62,30 +62,27 @@ STORES = {
             ".product-tile__image img",
             "img.product-image"
         ]
-    },
-    "woolworths": {
+      "woolworths": {
         "base": "https://www.woolworths.com.au",
         "search": "/shop/search/products?searchTerm={sku}",
         "price_selectors": [
-            "strong.price",
-            ".price-value",
-            "[data-testid='price']",
-            ".price"
+          "span[data-testid='price']",
+          "strong.price",
+          ".price-value",
+          ".price"
         ],
         "name_selectors": [
-            "a.product-tile--title-link",
-            ".product-title",
-            "h3.product-name",
-            ".product-tile__title"
+          "h1.product-title",
+          "[data-testid='product-title']",
+          ".product-title",
+          ".product-title__product"
         ],
         "image_selectors": [
-          "img[class*='ProductGallery_image']",
-          "img[class*='product-images__image']",
-          "div[data-testid='product-image-container'] img",
           "img[data-testid='product-image']",
-          "img[class*='ProductPage']",
+          "img[class*='ProductGallery_image']",
+          "div[data-testid='product-image-container'] img",
           ".product-image-gallery img",
-          ".carousel img"
+          ".carousel__image img"
         ]
     },
     "amazon": {
@@ -128,31 +125,28 @@ STORES = {
             ".s-item__wrapper img"
         ]
     },
-    "jbhifi": {
+     "jbhifi": {
         "base": "https://www.jbhifi.com.au",
-        "search": "/search?q={window.Product.sku}",
+        "search": "/search?q={sku}",
         "price_selectors": [
             "span[class*='PriceTag_actual']",
             "span.price",
             ".price-value",
-            ".product-price",
             ".price-current"
         ],
         "name_selectors": [
-            "a.product-tile__title",
+            "h1[data-testid='product-title']",
+            ".product-title",
             ".product-name",
-            "h3.product-title",
-            ".product-title a"
+            "a.product-tile__title"
         ],
         "image_selectors": [
             "img[class*='ProductPage__image']",
             ".product-image-carousel img",
             ".product-page__image img",
-            ".product-tile__image img",
-            ".product-image img",
             "img[data-testid='product-image']",
-            ".tile-image img"
-            ]
+            ".product-image img"
+        ]
     },
     "officeworks": {
         "base": "https://www.officeworks.com.au",
