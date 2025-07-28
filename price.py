@@ -129,6 +129,7 @@ STORES = {
         "base": "https://www.jbhifi.com.au",
         "search": "/search?q={sku}",
         "price_selectors": [
+            "span[class*='PriceTag_actual']",
             "span.price",
             ".price-value",
             ".product-price",
