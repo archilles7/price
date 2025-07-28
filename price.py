@@ -1,319 +1,752 @@
 import os
-from flask import Flask, render_template_string, request, redirect
+import json
+import re
+import time
+import logging
+from datetime import datetime, timedelta
+from threading import Thread, Lock
+from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
-import json
-import os
-import re
-import smtplib
-from email.mime.text import MIMEText
-from threading import Thread
-import time
+from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 
 # === CONFIGURATION ===
 ALERTS_FILE = "alerts.json"
+LOG_FILE = "price_tracker.log"
+RATE_LIMIT_DELAY = 2  # seconds between requests to same domain
+MAX_RETRIES = 3
+
+# Discord webhook URL
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/829925867655528519/C24e1fA5ajHbno5g7qLxlFLo7Hl1d2MjjsZTaXl6drrLTEDTZHZwgm2REZWYSHG1uPAC"
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+
+# Thread-safe file operations
+file_lock = Lock()
+
+# Initialize alerts file
 if not os.path.exists(ALERTS_FILE):
     with open(ALERTS_FILE, 'w') as f:
         json.dump([], f)
 
-# EMAIL SETTINGS (example using Gmail or Resend)
-EMAIL_PROVIDER = "resend"  # or "gmail"
-RESEND_API_KEY = "re_your_api_key_here"
-GMAIL_EMAIL = "you@gmail.com"
-GMAIL_APP_PASSWORD = "your_password"
-
-# STORES TO SUPPORT
+# STORES TO SUPPORT - Updated with image selectors
 STORES = {
     "coles": {
-        "base": "https://www.coles.com.au ",
+        "base": "https://www.coles.com.au",
         "search": "/search?q={sku}",
-        "price_sel": "span.price__value",
-        "name_sel": "h1[data-testid='product-title']"
+        "price_selectors": [
+            "span.price__value",
+            ".price-dollars",
+            "[data-testid='price-value']",
+            ".price"
+        ],
+        "name_selectors": [
+            "h1[data-testid='product-title']",
+            ".product-name",
+            "h1.product-title",
+            "a[data-testid='product-link']"
+        ],
+        "image_selectors": [
+            "img[data-testid='product-image']",
+            ".product-image img",
+            ".product-tile__image img",
+            "img.product-image"
+        ]
     },
     "woolworths": {
-        "base": "https://www.woolworths.com.au ",
+        "base": "https://www.woolworths.com.au",
         "search": "/shop/search/products?searchTerm={sku}",
-        "price_sel": "strong.price",
-        "name_sel": "a.product-tile--title-link"
+        "price_selectors": [
+            "strong.price",
+            ".price-value",
+            "[data-testid='price']",
+            ".price"
+        ],
+        "name_selectors": [
+            "a.product-tile--title-link",
+            ".product-title",
+            "h3.product-name",
+            ".product-tile__title"
+        ],
+        "image_selectors": [
+            ".product-tile__image img",
+            ".product-image img",
+            "img[data-testid='product-image']",
+            ".tile-image img"
+        ]
     },
     "amazon": {
-        "base": "https://www.amazon.com.au ",
+        "base": "https://www.amazon.com.au",
         "search": "/s?k={sku}",
-        "price_sel": ".a-price-whole",
-        "name_sel": "h2 a.a-link-normal"
+        "price_selectors": [
+            ".a-price-whole",
+            ".a-price.a-text-price.a-size-medium.apexPriceToPay",
+            "span.a-price-range",
+            ".a-price .a-offscreen"
+        ],
+        "name_selectors": [
+            "h2 a.a-link-normal span",
+            "span[data-component-type='s-product-image'] img",
+            ".s-size-mini .s-link-style",
+            "h2.a-size-mini span"
+        ],
+        "image_selectors": [
+            ".s-image",
+            "img[data-image-latency='s-product-image']",
+            ".a-section img.s-image",
+            ".s-product-image-container img"
+        ]
     },
     "ebay": {
-        "base": "https://www.ebay.com.au ",
+        "base": "https://www.ebay.com.au",
         "search": "/sch/i.html?_nkw={sku}",
-        "price_sel": ".s-item__price",
-        "name_sel": ".s-item__title"
+        "price_selectors": [
+            ".s-item__price",
+            ".notranslate",
+            ".s-item__detail--primary .s-item__price"
+        ],
+        "name_selectors": [
+            ".s-item__title",
+            "h3.s-item__title"
+        ],
+        "image_selectors": [
+            ".s-item__image img",
+            "img.s-item__image",
+            ".s-item__wrapper img"
+        ]
     },
     "jbhifi": {
-        "base": "https://www.jbhifi.com.au ",
+        "base": "https://www.jbhifi.com.au",
         "search": "/search?q={sku}",
-        "price_sel": "span.price",
-        "name_sel": "a.product-tile__title"
+        "price_selectors": [
+            "span.price",
+            ".price-value",
+            ".product-price",
+            ".price-current"
+        ],
+        "name_selectors": [
+            "a.product-tile__title",
+            ".product-name",
+            "h3.product-title",
+            ".product-title a"
+        ],
+        "image_selectors": [
+            ".product-tile__image img",
+            ".product-image img",
+            "img.product-img"
+        ]
     },
     "officeworks": {
-        "base": "https://www.officeworks.com.au ",
+        "base": "https://www.officeworks.com.au",
         "search": "/shop/search?q={sku}",
-        "price_sel": "span.price__value",
-        "name_sel": "a.product-tile__title"
+        "price_selectors": [
+            "span.price__value",
+            ".price-current",
+            ".product-price",
+            ".price"
+        ],
+        "name_selectors": [
+            "a.product-tile__title",
+            ".product-name",
+            ".product-title"
+        ],
+        "image_selectors": [
+            ".product-tile__image img",
+            ".product-image img",
+            "img.product-img"
+        ]
     },
     "harveynorman": {
-        "base": "https://www.harveynorman.com.au ",
+        "base": "https://www.harveynorman.com.au",
         "search": "/search?q={sku}",
-        "price_sel": "span.price",
-        "name_sel": "h4.product-name a"
+        "price_selectors": [
+            "span.price",
+            ".price-value",
+            ".product-price",
+            ".price-current"
+        ],
+        "name_selectors": [
+            "h4.product-name a",
+            ".product-title",
+            ".product-name"
+        ],
+        "image_selectors": [
+            ".product-image img",
+            "img.product-img",
+            ".product-tile__image img"
+        ]
     }
 }
 
-# === HELPERS ===
-def send_email(to_email, subject, body):
-    try:
-        if EMAIL_PROVIDER == "resend":
-            import resend
-            resend.api_key = RESEND_API_KEY
-            params = {
-                "from": "DealAlert <alert@dealalert.com>",
-                "to": to_email,
-                "subject": subject,
-                "html": body
-            }
-            resend.Emails.send(params)
-            print(f"✅ Email sent to {to_email}")
-        elif EMAIL_PROVIDER == "gmail":
-            msg = MIMEText(body, "html")
-            msg["Subject"] = subject
-            msg["From"] = GMAIL_EMAIL
-            msg["To"] = to_email
+# === UTILITY FUNCTIONS ===
+def load_alerts():
+    """Thread-safe alert loading"""
+    with file_lock:
+        try:
+            with open(ALERTS_FILE, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
 
-            server = smtplib.SMTP("smtp.gmail.com", 587)
-            server.starttls()
-            server.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
-            server.sendmail(GMAIL_EMAIL, to_email, msg.as_string())
-            server.quit()
+def save_alerts(alerts):
+    """Thread-safe alert saving"""
+    with file_lock:
+        with open(ALERTS_FILE, 'w') as f:
+            json.dump(alerts, f, indent=2)
+
+def send_discord_notification(title, description, fields=None, color=0x00ff00):
+    """Send notification via Discord webhook"""
+    try:
+        embed = {
+            "title": title,
+            "description": description,
+            "color": color,
+            "timestamp": datetime.utcnow().isoformat(),
+            "footer": {
+                "text": "Price Tracker Bot"
+            }
+        }
+        
+        if fields:
+            embed["fields"] = fields
+            
+        payload = {
+            "embeds": [embed]
+        }
+        
+        response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+        response.raise_for_status()
+        
+        logging.info("Discord notification sent successfully")
+        return True
+        
     except Exception as e:
-        print(f"❌ Failed to send email: {e}")
+        logging.error(f"Failed to send Discord notification: {e}")
+        return False
 
 def extract_sku(url):
-    """Try to find SKU/ID from URL"""
-    # Examples:
-    # Coles: .../product/...-8462360 → 8462360
-    # JB HiFi: /product/xxxxxx/sku-123456 → 123456
+    """Enhanced SKU extraction with better patterns"""
+    if not url:
+        return None
+        
+    # Clean URL
+    url = url.strip()
+    
+    # Enhanced patterns for different stores
     patterns = [
-        r'/(\d{5,})',           # Any 5+ digit number
-        r'sku[-=](\d+)',        # sku=12345 or sku-12345
-        r'p-(\d+)',             # p-12345
-        r'itemcode=(\d+)'       # ?itemcode=12345
+        r'/product/[^/]*-(\d{6,})',     # Coles style: /product/name-123456
+        r'/(\d{7,})',                   # Any 7+ digit number (more specific)
+        r'sku[-=_](\d+)',               # sku=12345, sku-12345, sku_12345
+        r'p[-=_](\d+)',                 # p-12345, p=12345
+        r'itemcode[=-](\d+)',           # itemcode=12345
+        r'product[/-](\d+)',            # product/12345, product-12345
+        r'dp/([A-Z0-9]{10})',           # Amazon ASIN
+        r'/(\d{5,})[/?]',               # 5+ digits followed by / or ?
+        r'item/(\d+)',                  # item/12345
     ]
+    
     for pattern in patterns:
-        match = re.search(pattern, url)
+        match = re.search(pattern, url, re.IGNORECASE)
         if match:
-            return match.group(1)
-    # Fallback: last digits in path
-    match = re.search(r'/(\d+)[^/]*$', url)
-    return match.group(1) if match else None
+            sku = match.group(1)
+            logging.info(f"Extracted SKU: {sku} from URL: {url}")
+            return sku
+    
+    # Fallback: last sequence of digits
+    match = re.search(r'(\d{4,})(?=[^/]*$)', url)
+    if match:
+        sku = match.group(1)
+        logging.info(f"Fallback SKU extraction: {sku}")
+        return sku
+        
+    logging.warning(f"Could not extract SKU from URL: {url}")
+    return None
 
-def get_store_price(store_key, sku):
-    store = STORES[store_key]
-    search_url = store["base"] + store["search"].format(sku=sku)
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+def clean_price_text(price_text):
+    """Clean and extract price from text"""
+    if not price_text:
+        return None
+        
+    # Remove common currency symbols and whitespace
+    cleaned = re.sub(r'[^\d.,]', '', price_text.replace(',', ''))
+    
+    # Extract first valid number
+    match = re.search(r'\d+(?:\.\d{1,2})?', cleaned)
+    if match:
+        try:
+            return float(match.group())
+        except ValueError:
+            return None
+    return None
 
+def get_product_info(url):
+    """Get product info from original URL"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    
     try:
-        response = requests.get(search_url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-
-        price_el = soup.select_one(store["price_sel"])
-        name_el = soup.select_one(store["name_sel"])
-
-        if not price_el:
-            return None, None
-
-        price_text = price_el.get_text(strip=True)
-        price = float(re.search(r'\d+(?:\.\d+)?', price_text.replace(',', '')).group())
-
-        name = name_el.get_text(strip=True) if name_el else f"Product {sku}"
-
+        
+        # Try to extract product info
+        name = None
+        image = None
+        price = None
+        
+        # Generic selectors for product name
+        name_selectors = [
+            "h1", "h2.product-title", ".product-name", "[data-testid='product-title']",
+            ".product-title", "h1.product-title", ".product-info h1"
+        ]
+        
+        for selector in name_selectors:
+            name_el = soup.select_one(selector)
+            if name_el and name_el.get_text(strip=True):
+                name = name_el.get_text(strip=True)[:100]
+                break
+        
+        # Generic selectors for product image
+        image_selectors = [
+            "img[data-testid='product-image']", ".product-image img", 
+            ".hero-image img", ".main-image img", "img.product-img",
+            ".product-photos img", ".product-gallery img"
+        ]
+        
+        for selector in image_selectors:
+            img_el = soup.select_one(selector)
+            if img_el and img_el.get('src'):
+                image = img_el.get('src')
+                if not image.startswith('http'):
+                    image = urljoin(url, image)
+                break
+        
+        # Generic selectors for price
+        price_selectors = [
+            ".price", ".price-value", ".price__value", "[data-testid='price']",
+            ".current-price", ".sale-price", ".product-price"
+        ]
+        
+        for selector in price_selectors:
+            price_el = soup.select_one(selector)
+            if price_el:
+                price_text = price_el.get_text(strip=True)
+                price = clean_price_text(price_text)
+                if price:
+                    break
+        
         return {
+            "name": name or "Product",
+            "image": image,
             "price": price,
-            "name": name,
-            "url": search_url,
-            "store": store_key.capitalize()
-        }, None
+            "url": url
+        }
+        
     except Exception as e:
-        return None, str(e)
+        logging.error(f"Error fetching product info: {e}")
+        return None
+
+def get_store_price(store_key, sku, retries=MAX_RETRIES):
+    """Enhanced price fetching with image support"""
+    if store_key not in STORES:
+        return None, f"Unknown store: {store_key}"
+        
+    store = STORES[store_key]
+    search_url = urljoin(store["base"], store["search"].format(sku=sku))
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    for attempt in range(retries):
+        try:
+            logging.info(f"Fetching price from {store_key} (attempt {attempt + 1})")
+            
+            response = requests.get(search_url, headers=headers, timeout=15)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            # Try multiple price selectors
+            price = None
+            price_text = ""
+            for selector in store["price_selectors"]:
+                price_el = soup.select_one(selector)
+                if price_el:
+                    price_text = price_el.get_text(strip=True)
+                    price = clean_price_text(price_text)
+                    if price:
+                        break
+
+            # Try multiple name selectors
+            name = None
+            for selector in store["name_selectors"]:
+                name_el = soup.select_one(selector)
+                if name_el:
+                    name = name_el.get_text(strip=True)
+                    if name and len(name) > 3:  # Basic validation
+                        break
+            
+            # Try to get product image
+            image = None
+            for selector in store["image_selectors"]:
+                img_el = soup.select_one(selector)
+                if img_el and img_el.get('src'):
+                    image = img_el.get('src')
+                    if not image.startswith('http'):
+                        image = urljoin(store["base"], image)
+                    break
+
+            if not price:
+                logging.warning(f"No price found for {sku} at {store_key}")
+                return None, f"No price found (tried: {price_text})"
+
+            if not name:
+                name = f"Product {sku}"
+
+            result = {
+                "price": price,
+                "name": name[:100],  # Limit length
+                "image": image,
+                "url": search_url,
+                "store": store_key.capitalize(),
+                "last_checked": datetime.now().isoformat(),
+                "available": True
+            }
+            
+            logging.info(f"Found: {name} - ${price} at {store_key}")
+            time.sleep(RATE_LIMIT_DELAY)  # Rate limiting
+            return result, None
+
+        except requests.RequestException as e:
+            logging.warning(f"Request failed for {store_key} (attempt {attempt + 1}): {e}")
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+            continue
+        except Exception as e:
+            logging.error(f"Unexpected error for {store_key}: {e}")
+            break
+
+    return {
+        "store": store_key.capitalize(),
+        "available": False,
+        "error": f"Failed after {retries} attempts"
+    }, None
 
 # === BACKGROUND MONITORING ===
 def start_monitoring():
+    """Enhanced monitoring with Discord notifications"""
+    logging.info("Starting price monitoring service")
+    
     while True:
-        with open(ALERTS_FILE, 'r') as f:
-            alerts = json.load(f)
+        try:
+            alerts = load_alerts()
+            updated_alerts = []
+            
+            for alert in alerts:
+                if alert.get('notified'):
+                    # Check if we should reset notification after some time
+                    if 'trigger_time' in alert:
+                        trigger_time = datetime.fromisoformat(alert['trigger_time'])
+                        if datetime.now() - trigger_time > timedelta(days=7):
+                            alert['notified'] = False
+                            logging.info(f"Reset notification for alert {alert.get('sku')}")
+                    
+                    updated_alerts.append(alert)
+                    continue
 
-        updated_alerts = []
-        for alert in alerts:
-            if alert.get('notified'):
+                logging.info(f"Checking alert for SKU: {alert.get('sku')}")
+                matched_stores = []
+                
+                for store in alert.get('stores', []):
+                    data, error = get_store_price(store, alert['sku'])
+                    if data and data.get('available'):
+                        threshold = alert.get('target_price', alert['retail_price'] * (1 - alert['discount_rate']/100))
+                        if data['price'] <= threshold:
+                            matched_stores.append(data)
+                            logging.info(f"Deal found: {data['name']} at {store} for ${data['price']}")
+
+                if matched_stores:
+                    # Send Discord notification
+                    title = f"🎉 Deal Alert: Price Drop Found!"
+                    description = f"Great news! We found deals for **{alert.get('sku')}** that meet your target price!"
+                    
+                    fields = []
+                    for item in matched_stores:
+                        savings = alert['retail_price'] - item['price']
+                        percentage = (savings / alert['retail_price']) * 100
+                        fields.append({
+                            "name": f"{item['store']}",
+                            "value": f"**{item['name'][:50]}...**\n💰 ${item['price']:.2f} (Save ${savings:.2f} - {percentage:.1f}% off)\n🔗 [View Deal]({item['url']})",
+                            "inline": True
+                        })
+                    
+                    if send_discord_notification(title, description, fields):
+                        alert['notified'] = True
+                        alert['trigger_time'] = datetime.now().isoformat()
+                        alert['deals_found'] = matched_stores
+
                 updated_alerts.append(alert)
-                continue
 
-            matched_stores = []
-            for store in alert['stores']:
-                data, err = get_store_price(store, alert['sku'])
-                if data:
-                    threshold = alert['retail_price'] * (1 - alert['discount_rate']/100)
-                    if data['price'] <= threshold:
-                        matched_stores.append(data)
+            save_alerts(updated_alerts)
+            logging.info("Price check cycle completed")
+            
+        except Exception as e:
+            logging.error(f"Error in monitoring loop: {e}")
+        
+        # Sleep for 30 minutes
+        time.sleep(1800)
 
-            if matched_stores:
-                subject = f"🎉 Deal Found Across {len(matched_stores)} Stores!"
-                items_list = "".join([
-                    f"<li><b>{i['store']}</b>: {i['name']} – ${i['price']} <a href='{i['url']}'>View</a></li>"
-                    for i in matched_stores
-                ])
-                body = f"""
-                <h2>🔥 Price Alert Triggered!</h2>
-                <p>Your desired discount ({alert['discount_rate']}%) was found:</p>
-                <ul>{items_list}</ul>
-                """
-                send_email(alert['email'], subject, body)
-                alert['notified'] = True
-                alert['trigger_time'] = time.time()
-
-            updated_alerts.append(alert)
-
-        with open(ALERTS_FILE, 'w') as f:
-            json.dump(updated_alerts, f)
-
-        time.sleep(1800)  # Every 30 mins
-
+# Start monitoring in background
 Thread(target=start_monitoring, daemon=True).start()
 
-# === HTML FORM WITH CHECKBOXES ===
+# === WEB INTERFACE ===
 FORM_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>🛒 Multi-Store Price Tracker</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap @5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    .hero { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+    .store-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
+    .store-card { border: 1px solid #ddd; padding: 15px; border-radius: 8px; text-align: center; }
+    .product-preview { border: 2px dashed #ddd; padding: 20px; text-align: center; min-height: 200px; }
+    .product-preview.loading { background: #f8f9fa; }
+    .product-preview img { max-width: 200px; max-height: 150px; object-fit: contain; }
+    .price-options { background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0; }
+  </style>
 </head>
-<body class="p-4">
-<div class="container">
-  <h1 class="mb-3">🛒 DealFinder</h1>
-  <p class="text-muted">Enter a product link. We'll extract the ID and let you track it across multiple stores.</p>
-
-  <form method="POST" action="/submit">
-    <div class="mb-3">
-      <label>Product URL (e.g., Coles, Amazon, etc.)</label>
-      <input type="url" name="url" class="form-control" required placeholder="https://www.coles.com.au/product/... ">
-    </div>
-
-    <div class="mb-3">
-      <label>Retail Price ($) – Original price you're comparing against</label>
-      <input type="number" step="0.01" name="retail_price" class="form-control" required>
-    </div>
-
-    <div class="mb-3">
-      <label>Target Discount Rate (%)</label>
-      <input type="number" name="discount_rate" class="form-control" min="1" max="100" required placeholder="e.g., 20 for 20% off">
-    </div>
-
-    <div class="mb-3">
-      <label>Your Email</label>
-      <input type="email" name="email" class="form-control" required>
-    </div>
-
-    <button type="submit" class="btn btn-primary">➡️ Next: Select Stores to Monitor</button>
-  </form>
+<body>
+<div class="hero py-5 text-center">
+  <div class="container">
+    <h1 class="display-4">🛒 Smart Price Tracker</h1>
+    <p class="lead">Track prices across multiple Australian retailers and get Discord notifications when deals match your target!</p>
+  </div>
 </div>
+
+<div class="container my-5">
+  <div class="row">
+    <div class="col-md-8 mx-auto">
+      <div class="card shadow">
+        <div class="card-body">
+          <form method="POST" action="/submit" id="priceForm">
+            <div class="mb-4">
+              <label class="form-label fw-bold">Product URL</label>
+              <input type="url" name="url" id="productUrl" class="form-control form-control-lg" required 
+                     placeholder="https://www.coles.com.au/product/...">
+              <div class="form-text">Paste any product URL from supported stores</div>
+            </div>
+
+            <!-- Product Preview Section -->
+            <div id="productPreview" class="product-preview mb-4" style="display:none;">
+              <div class="spinner-border text-primary" role="status" id="loadingSpinner">
+                <span class="visually-hidden">Loading...</span>
+              </div>
+              <div id="previewContent" style="display:none;">
+                <img id="previewImage" src="" alt="Product Image" class="mb-3">
+                <h5 id="previewName">Product Name</h5>
+                <p class="text-muted" id="previewPrice">Current Price: $0.00</p>
+              </div>
+            </div>
+
+            <div class="price-options">
+              <h5 class="mb-3">💰 Price Target Options</h5>
+              <div class="row">
+                <div class="col-md-4 mb-3">
+                  <label class="form-label fw-bold">Current Retail Price ($)</label>
+                  <input type="number" step="0.01" name="retail_price" id="retailPrice" class="form-control" min="0.01">
+                  <div class="form-text">The regular/current price</div>
+                </div>
+                <div class="col-md-4 mb-3">
+                  <label class="form-label fw-bold">Target Price ($)</label>
+                  <input type="number" step="0.01" name="target_price" id="targetPrice" class="form-control" min="0.01">
+                  <div class="form-text">Exact price you want</div>
+                </div>
+                <div class="col-md-4 mb-3">
+                  <label class="form-label fw-bold">OR Discount Rate (%)</label>
+                  <input type="number" name="discount_rate" id="discountRate" class="form-control" min="5" max="90" placeholder="20">
+                  <div class="form-text">Percentage off retail</div>
+                </div>
+              </div>
+              <div class="alert alert-info">
+                <small><strong>Note:</strong> Enter either a specific target price OR a discount percentage. Target price takes priority if both are provided.</small>
+              </div>
+            </div>
+
+            <div class="mb-4">
+              <label class="form-label fw-bold">Discord User (Optional)</label>
+              <input type="text" name="discord_user" class="form-control" placeholder="@username or user#1234">
+              <div class="form-text">We'll mention you in Discord notifications</div>
+            </div>
+
+            <button type="submit" class="btn btn-primary btn-lg w-100">
+              ➡️ Find Current Prices & Set Alert
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row mt-5">
+    <div class="col-12">
+      <h3 class="text-center mb-4">Supported Stores</h3>
+      <div class="store-grid">
+        <div class="store-card">📦 Coles</div>
+        <div class="store-card">🛒 Woolworths</div>
+        <div class="store-card">📱 Amazon AU</div>
+        <div class="store-card">🏪 eBay AU</div>
+        <div class="store-card">🎵 JB Hi-Fi</div>
+        <div class="store-card">🏢 Officeworks</div>
+        <div class="store-card">🖥️ Harvey Norman</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let previewTimeout;
+
+document.getElementById('productUrl').addEventListener('input', function() {
+    const url = this.value.trim();
+    const preview = document.getElementById('productPreview');
+    const spinner = document.getElementById('loadingSpinner');
+    const content = document.getElementById('previewContent');
+    
+    // Clear previous timeout
+    clearTimeout(previewTimeout);
+    
+    if (url && url.startsWith('http')) {
+        preview.style.display = 'block';
+        spinner.style.display = 'block';
+        content.style.display = 'none';
+        
+        // Debounce the API call
+        previewTimeout = setTimeout(() => {
+            fetch('/preview', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: 'url=' + encodeURIComponent(url)
+            })
+            .then(response => response.json())
+            .then(data => {
+                spinner.style.display = 'none';
+                if (data.success) {
+                    document.getElementById('previewImage').src = data.image || '/static/no-image.png';
+                    document.getElementById('previewName').textContent = data.name || 'Product';
+                    document.getElementById('previewPrice').textContent = data.price ? `Current Price: $${data.price}` : 'Price not available';
+                    
+                    // Auto-fill retail price if found
+                    if (data.price && !document.getElementById('retailPrice').value) {
+                        document.getElementById('retailPrice').value = data.price;
+                    }
+                    
+                    content.style.display = 'block';
+                } else {
+                    content.innerHTML = '<p class="text-danger">Could not load product preview</p>';
+                    content.style.display = 'block';
+                }
+            })
+            .catch(error => {
+                spinner.style.display = 'none';
+                content.innerHTML = '<p class="text-danger">Error loading preview</p>';
+                content.style.display = 'block';
+            });
+        }, 1000); // 1 second delay
+    } else {
+        preview.style.display = 'none';
+    }
+});
+
+// Auto-calculate target price when discount rate changes
+document.getElementById('discountRate').addEventListener('input', function() {
+    const retailPrice = parseFloat(document.getElementById('retailPrice').value);
+    const discountRate = parseFloat(this.value);
+    
+    if (retailPrice && discountRate) {
+        const targetPrice = retailPrice * (1 - discountRate / 100);
+        document.getElementById('targetPrice').value = targetPrice.toFixed(2);
+    }
+});
+
+// Auto-calculate discount rate when target price changes
+document.getElementById('targetPrice').addEventListener('input', function() {
+    const retailPrice = parseFloat(document.getElementById('retailPrice').value);
+    const targetPrice = parseFloat(this.value);
+    
+    if (retailPrice && targetPrice && targetPrice < retailPrice) {
+        const discountRate = ((retailPrice - targetPrice) / retailPrice) * 100;
+        document.getElementById('discountRate').value = Math.round(discountRate);
+    }
+});
+</script>
 </body>
 </html>
 '''
 
-SELECT_STORES_HTML = '''
+RESULTS_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <title>Select Stores</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap @5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-</head>
-<body class="p-4">
-<div class="container">
-  <h2>🔍 Found Product ID: <code>{{sku}}</code></h2>
-  <p>Select where you want to track this item:</p>
-
-  <form method="POST" action="/confirm">
-    <input type="hidden" name="url" value="{{url}}">
-    <input type="hidden" name="retail_price" value="{{retail_price}}">
-    <input type="hidden" name="discount_rate" value="{{discount_rate}}">
-    <input type="hidden" name="email" value="{{email}}">
-    <input type="hidden" name="sku" value="{{sku}}">
-
-    {% for store in stores %}
-    <div class="form-check mb-2">
-      <input class="form-check-input" type="checkbox" name="stores" value="{{store}}" id="store_{{store}}" checked>
-      <label class="form-check-label" for="store_{{store}}">
-        {{store|capitalize}}
-      </label>
-    </div>
-    {% endfor %}
-
-    <button type="submit" class="btn btn-success">🔔 Set Multi-Store Alert</button>
-  </form>
-</div>
-</body>
-</html>
-'''
-
-@app.route('/')
-def index():
-    return render_template_string(FORM_HTML)
-
-@app.route('/submit', methods=['POST'])
-def submit():
-    url = request.form['url']
-    retail_price = float(request.form['retail_price'])
-    discount_rate = float(request.form['discount_rate'])
-    email = request.form['email']
-
-    sku = extract_sku(url)
-    if not sku:
-        return "<h1>❌ Could not extract product ID from URL.</h1><p>Make sure it contains a number (like 12345).</p>", 400
-
-    # Render checkbox page
-    return render_template_string(
-        SELECT_STORES_HTML,
-        sku=sku,
-        url=url,
-        retail_price=retail_price,
-        discount_rate=discount_rate,
-        email=email,
-        stores=STORES.keys()
-    )
-
-@app.route('/confirm', methods=['POST'])
-def confirm():
-    # Get all data
-    alert = {
-        "url": request.form['url'],
-        "sku": request.form['sku'],
-        "retail_price": float(request.form['retail_price']),
-        "discount_rate": float(request.form['discount_rate']),
-        "email": request.form['email'],
-        "stores": request.form.getlist('stores'),
-        "notified": False
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Price Comparison Results</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    .price-card { transition: transform 0.2s; }
+    .price-card:hover { transform: translateY(-5px); }
+    .not-available { opacity: 0.6; background: #f8f9fa; }
+    .best-deal { border: 3px solid #28a745 !important; position: relative; }
+    .best-deal::before { 
+      content: "🏆 BEST DEAL"; 
+      position: absolute; 
+      top: -10px; 
+      left: 10px; 
+      background: #28a745; 
+      color: white; 
+      padding: 5px 10px; 
+      border-radius: 15px; 
+      font-size: 12px; 
+      font-weight: bold;
     }
-
-    # Save alert
-    with open(ALERTS_FILE, 'r') as f:
-        alerts = json.load(f)
-    alerts.append(alert)
-    with open(ALERTS_FILE, 'w') as f:
-        json.dump(alerts, f)
-
-    return "<h1>✅ Success!</h1><p>We’ll monitor this product across selected stores and email you when the price drops.</p>"
-
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    .product-image { width: 100%; height: 200px; object-fit: contain; background: #f8f9fa; }
+    .not-available-img { width: 100%; height: 200px; background: #f8f9fa; display: flex; align-items: center; justify-content: center; }
+    .alert-summary { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+  </style>
+</head>
+<body class="bg-light">
+<div class="container py-5">
+  <!-- Alert Summary -->
+  <div class="alert-summary p-4 rounded mb-4">
+    <h2 class="mb-3">✅ Price Alert Set Successfully!</h2>
+    <div class="row">
+      <div class="col-md-6">
+        <p><strong>Product:</strong> {{original_product.name}}</p>
+        <p><strong>SKU/ID:</strong> {{sku}}</p>
+        <p><strong>Current Retail Price:</strong> ${{retail_price}}</p>
+      </div>
+      <div class="col-md-6">
+        <p><strong>
