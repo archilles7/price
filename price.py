@@ -62,6 +62,7 @@ STORES = {
             ".product-tile__image img",
             "img.product-image"
         ]
+    },
       "woolworths": {
         "base": "https://www.woolworths.com.au",
         "search": "/shop/search/products?searchTerm={sku}",
